@@ -1,356 +1,245 @@
-# pages/01_Ingestion_and_Curation_Desk.py
-# Ingestion & Curation Desk — SAFE MODE (no loops, no brittle paths, no hard deps)
-# - Writes to ./storage/datasets (always writable on Streamlit Cloud)
-# - Excel support optional; if openpyxl is missing, XLSX is disabled automatically
-# - MD5 de-dup to prevent duplicate saves
-# - Upload (manual), list, delete, preview, column imputation (Skip/Mean/Median/Mode), save new dataset
+# pages/1_Data_Upload.py
+# v1.7.0  Upload, delete, inspect, and correlation (Altair heatmap; no matplotlib needed)
 
 import os
-import io
-import time
-from hashlib import md5
-from typing import Tuple, Optional
+from datetime import datetime
+from typing import List, Dict
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 
-# ---------- Optional Excel support ----------
+# Try Altair for heatmap (Streamlit ships with it); fall back to table-only if unavailable
 try:
-    import openpyxl  # for .xlsx read/write
-    HAVE_OPENPYXL = True
+    import altair as alt
+    ALT_AVAILABLE = True
 except Exception:
-    HAVE_OPENPYXL = False
+    ALT_AVAILABLE = False
 
-# ---------- Storage paths (safe & writable) ----------
-APP_ROOT = os.getcwd()
-STORAGE_DIR = os.path.join(APP_ROOT, "storage")
-DATASETS_DIR = os.path.join(STORAGE_DIR, "datasets")
-os.makedirs(DATASETS_DIR, exist_ok=True)
+st.title("Data Upload")
 
-# ---------- Helpers ----------
-def _human_kb(size_bytes: int) -> float:
-    try:
-        return round((size_bytes or 0) / 1024.0, 2)
-    except Exception:
-        return 0.0
+DATA_DIR = "data"
+os.makedirs(DATA_DIR, exist_ok=True)
 
-def _safe_filename(name: str) -> str:
-    base, ext = os.path.splitext(name)
-    safe_base = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in base).strip("_")
-    # allow only csv/xlsx
-    if ext.lower() not in (".csv", ".xlsx"):
-        ext = ".csv"
-    return (safe_base or "dataset") + ext
+# Ensure guard state exists
+if "delete_all_guard" not in st.session_state:
+    st.session_state["delete_all_guard"] = False
 
-def _unique_path(dirpath: str, filename: str) -> str:
-    candidate = os.path.join(dirpath, filename)
-    if not os.path.exists(candidate):
-        return candidate
-    base, ext = os.path.splitext(filename)
-    i = 1
-    while True:
-        cand = os.path.join(dirpath, f"{base}_{i}{ext}")
-        if not os.path.exists(cand):
-            return cand
-        i += 1
+# ---------------- Helpers ----------------
+def _human_size(n: int) -> str:
+    units = ["B", "KB", "MB", "GB", "TB"]
+    s = float(max(0, n))
+    for u in units:
+        if s < 1024 or u == units[-1]:
+            return "{:,.0f} {}".format(s, u)
+        s /= 1024.0
 
-def _file_md5_bytes(b: bytes) -> str:
-    return md5(b).hexdigest()
+def _list_files() -> List[str]:
+    return sorted([f for f in os.listdir(DATA_DIR) if f.lower().endswith((".csv", ".xlsx"))])
 
-def _file_md5_path(path: str, chunk_size: int = 1024 * 1024) -> str:
-    h = md5()
-    with open(path, "rb") as f:
-        while True:
-            chunk = f.read(chunk_size)
-            if not chunk:
-                break
-            h.update(chunk)
-    return h.hexdigest()
+def _load_df(path: str, excel_sheet: str = None) -> pd.DataFrame:
+    if path.lower().endswith(".csv"):
+        return pd.read_csv(path)
+    else:
+        if excel_sheet is None:
+            xls = pd.ExcelFile(path)
+            sheet = xls.sheet_names[0]
+            return pd.read_excel(path, sheet_name=sheet)
+        return pd.read_excel(path, sheet_name=excel_sheet)
 
-def _list_dataset_files():
-    files = []
-    for fn in os.listdir(DATASETS_DIR):
-        full = os.path.join(DATASETS_DIR, fn)
-        if not os.path.isfile(full):
-            continue
-        ext = os.path.splitext(fn)[1].lower()
-        if ext not in (".csv", ".xlsx"):
-            continue
+# Cross-page save banners (from Modeling/Advanced/Results)
+if st.session_state.get("last_saved_path"):
+    st.success("Saved: {}".format(st.session_state["last_saved_path"]))
+if st.session_state.get("last_save_error"):
+    st.error(st.session_state["last_save_error"])
+
+# ---------------- Upload ----------------
+st.subheader("Upload files")
+uploaded = st.file_uploader(
+    "Upload CSV or Excel files", type=["csv", "xlsx"], accept_multiple_files=True
+)
+if uploaded:
+    saved = 0
+    for uf in uploaded:
         try:
-            stat = os.stat(full)
-            files.append({
-                "name": fn,
-                "path": full,
-                "type": ext.strip("."),
-                "size_kb": _human_kb(stat.st_size),
-                "modified_ts": int(stat.st_mtime),
+            dest = os.path.join(DATA_DIR, uf.name)
+            # Overwrite if exists to keep things simple/explicit
+            with open(dest, "wb") as f:
+                f.write(uf.getbuffer())
+            saved += 1
+        except Exception as e:
+            st.error("Failed to save {}: {}".format(uf.name, e))
+    if saved:
+        st.success("Uploaded {} file(s) to data/".format(saved))
+        st.rerun()
+
+# ---------------- Inventory + Delete ----------------
+st.subheader("Files in data/")
+files = _list_files()
+if not files:
+    st.info("No files found. Upload CSV or XLSX above.")
+else:
+    rows: List[Dict[str, str]] = []
+    for fn in files:
+        p = os.path.join(DATA_DIR, fn)
+        try:
+            stt = os.stat(p)
+            rows.append({
+                "File": fn,
+                "Type": "CSV" if fn.lower().endswith(".csv") else "Excel",
+                "Size": _human_size(stt.st_size),
+                "Modified": datetime.fromtimestamp(stt.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
             })
         except Exception:
-            pass
-    files.sort(key=lambda x: x["modified_ts"], reverse=True)
-    return files
+            rows.append({"File": fn, "Type": "?", "Size": "?", "Modified": "?"})
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, height=min(360, 40 + 38*max(1, len(rows))))
 
-def _read_preview(path: str, ext: str, nrows: int = 100) -> pd.DataFrame:
-    if ext == ".csv":
-        return pd.read_csv(path, nrows=nrows)
-    # ext == ".xlsx"
-    if not HAVE_OPENPYXL:
-        raise RuntimeError("XLSX preview requires openpyxl. Install openpyxl>=3.1.2 or upload CSV.")
-    return pd.read_excel(path, nrows=nrows, engine="openpyxl")
+    del_sel = st.multiselect("Select files to delete", options=files)
+    c1, c2, c3 = st.columns([1,1,3])
+    with c1:
+        if st.button("Delete selected"):
+            if not del_sel:
+                st.warning("Select one or more files to delete.")
+            else:
+                deleted, errs = 0, 0
+                for fn in del_sel:
+                    try:
+                        os.remove(os.path.join(DATA_DIR, fn))
+                        deleted += 1
+                    except Exception as e:
+                        errs += 1
+                        st.error("Could not delete {}: {}".format(fn, e))
+                if deleted:
+                    st.success("Deleted {} file(s).".format(deleted))
+                st.rerun()
+    with c2:
+        if st.button("Delete ALL (guarded)"):
+            st.session_state["delete_all_guard"] = True
 
-def _read_full(path: str, ext: str) -> pd.DataFrame:
-    if ext == ".csv":
-        return pd.read_csv(path)
-    if not HAVE_OPENPYXL:
-        raise RuntimeError("Reading XLSX requires openpyxl. Install openpyxl>=3.1.2 or upload CSV.")
-    return pd.read_excel(path, engine="openpyxl")
+    if st.session_state["delete_all_guard"]:
+        st.warning("Type DELETE ALL to confirm full purge of data/ folder.")
+        confirm = st.text_input("Type exactly: DELETE ALL")
+        cL, cR = st.columns(2)
+        with cL:
+            if st.button("Confirm full delete"):
+                if confirm.strip().upper() == "DELETE ALL":
+                    errs = 0
+                    for fn in list(_list_files()):
+                        try:
+                            os.remove(os.path.join(DATA_DIR, fn))
+                        except Exception:
+                            errs += 1
+                    st.session_state["delete_all_guard"] = False
+                    if errs == 0:
+                        st.success("All files deleted.")
+                    else:
+                        st.error("Some files could not be deleted.")
+                    st.rerun()
+                else:
+                    st.error("Confirmation text did not match.")
+        with cR:
+            if st.button("Cancel"):
+                st.session_state["delete_all_guard"] = False
+                st.rerun()
 
-def _quick_shape(path: str, ext: str) -> Tuple[Optional[int], Optional[int]]:
-    try:
-        if ext == ".csv":
-            with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                header = f.readline()
-            cols = len(pd.read_csv(io.StringIO(header), nrows=0).columns) if header else 0
-            with open(path, "rb") as fb:
-                row_lines = sum(1 for _ in fb)
-            rows = max(row_lines - 1, 0)
-            return rows, cols
-        if ext == ".xlsx" and HAVE_OPENPYXL:
-            df0 = pd.read_excel(path, nrows=0, engine="openpyxl")
-            cols = len(df0.columns)
-            df = pd.read_excel(path, usecols=list(df0.columns), engine="openpyxl")
-            rows = len(df)
-            return rows, cols
-    except Exception:
-        pass
-    try:
-        df = _read_full(path, ext)
-        return df.shape[0], df.shape[1]
-    except Exception:
-        return None, None
-
-def _impute_column(series: pd.Series, method: str) -> pd.Series:
-    if method == "Skip":
-        return series
-    if method == "Mean":
-        s_num = pd.to_numeric(series, errors="coerce")
-        mean_val = s_num.mean()
-        if pd.isna(mean_val):
-            mode_vals = series.mode(dropna=True)
-            fill_val = mode_vals.iloc[0] if not mode_vals.empty else ""
-            return series.fillna(fill_val)
-        return series.fillna(mean_val)
-    if method == "Median":
-        s_num = pd.to_numeric(series, errors="coerce")
-        med_val = s_num.median()
-        if pd.isna(med_val):
-            mode_vals = series.mode(dropna=True)
-            fill_val = mode_vals.iloc[0] if not mode_vals.empty else ""
-            return series.fillna(fill_val)
-        return series.fillna(med_val)
-    if method == "Mode":
-        mode_vals = series.mode(dropna=True)
-        fill_val = mode_vals.iloc[0] if not mode_vals.empty else ""
-        return series.fillna(fill_val)
-    return series
-
-def _save_new_dataset(df: pd.DataFrame, base_name: str, to_xlsx: bool) -> str:
-    base_name = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in base_name).strip("_") or "dataset_imputed"
-    ext = "xlsx" if to_xlsx else "csv"
-    filename = f"{base_name}.{ext}"
-    dest = _unique_path(DATASETS_DIR, filename)
-    if to_xlsx:
-        if not HAVE_OPENPYXL:
-            raise RuntimeError("Saving XLSX requires openpyxl. Install openpyxl>=3.1.2 or save as CSV.")
-        df.to_excel(dest, index=False, engine="openpyxl")
-    else:
-        df.to_csv(dest, index=False)
-    return dest
-
-# ---------- UI ----------
-st.set_page_config(page_title="Ingestion & Curation Desk", layout="wide")
-st.title("Ingestion & Curation Desk")
-
-# Session state
-st.session_state.setdefault("_ingested_md5", set())
-
-# ===== 1) Upload files =====
-st.subheader("Upload files")
-
-# Only allow XLSX if openpyxl is available
-allowed_types = ["csv", "xlsx"] if HAVE_OPENPYXL else ["csv"]
-if not HAVE_OPENPYXL:
-    st.caption("XLSX features disabled (openpyxl not installed). CSV uploads fully supported.")
-
-uploads = st.file_uploader(
-    "Choose one or more files",
-    type=allowed_types,
-    accept_multiple_files=True,
-    key="uploader_files"
-)
-
-col_a, col_b, col_c = st.columns([1, 1, 1])
-with col_a:
-    save_uploads = st.button("Save uploaded files", type="primary")
-with col_b:
-    refresh_files = st.button("Refresh files list")
-with col_c:
-    clear_selected = st.button("Clear selected files")
-
-if clear_selected:
-    # Reset uploader by changing its key
-    st.session_state["uploader_files"] = None
-
-if save_uploads and uploads:
-    saved_count = 0
-    for up in uploads:
-        try:
-            buf = bytes(up.getbuffer())
-            h = _file_md5_bytes(buf)
-            if h in st.session_state["_ingested_md5"]:
-                continue  # same payload already saved this session
-
-            safe_name = _safe_filename(up.name)
-            dest = os.path.join(DATASETS_DIR, safe_name)
-
-            if os.path.exists(dest):
-                # If same content on disk, skip; else, use unique suffix
-                try:
-                    if _file_md5_path(dest) == h:
-                        st.session_state["_ingested_md5"].add(h)
-                        continue
-                except Exception:
-                    pass
-                dest = _unique_path(DATASETS_DIR, safe_name)
-
-            with open(dest, "wb") as w:
-                w.write(buf)
-
-            st.session_state["_ingested_md5"].add(h)
-            saved_count += 1
-        except Exception as e:
-            st.error(f"Failed to save {up.name}: {e}")
-
-    if saved_count:
-        st.success(f"Uploaded {saved_count} file(s).")
-
-st.divider()
-
-# ===== 2) Files list with delete =====
-st.subheader("Available files")
-files = _list_dataset_files()
-
-meta_rows = []
-for f in files:
-    rows, cols = _quick_shape(f["path"], "." + f["type"])
-    meta_rows.append({
-        "Name": f["name"],
-        "Type": f["type"],
-        "Size (KB)": f["size_kb"],
-        "Modified": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(f["modified_ts"])),
-        "Total Rows": rows if rows is not None else "",
-        "Total Columns": cols if cols is not None else "",
-    })
-
-h = 320 if len(files) > 5 else (180 if len(files) else 120)
-st.dataframe(pd.DataFrame(meta_rows), use_container_width=True, height=h)
-
-c1, c2 = st.columns([3, 1])
-with c1:
-    del_choice = st.selectbox("Delete a file", options=["-- Select --"] + [f["name"] for f in files])
-with c2:
-    do_delete = st.button("Delete", disabled=(del_choice == "-- Select --"))
-
-if do_delete:
-    target = next((f for f in files if f["name"] == del_choice), None)
-    if target:
-        try:
-            os.remove(target["path"])
-            st.warning(f"Deleted: {del_choice}")
-        except Exception as e:
-            st.error(f"Could not delete {del_choice}: {e}")
-
-st.divider()
-
-# ===== 3) File Analyzer =====
-st.subheader("File Analyzer")
-
+# ---------------- Inspect and Correlation ----------------
+st.subheader("Inspect a file")
+files = _list_files()
 if not files:
-    st.info("No files available yet. Upload CSV (and XLSX if openpyxl is installed).")
+    st.info("Nothing to inspect yet.")
+    st.stop()
+
+sel_file = st.selectbox("Choose a file", options=files, index=0)
+
+excel_sheet = None
+if sel_file.lower().endswith(".xlsx"):
+    try:
+        xls = pd.ExcelFile(os.path.join(DATA_DIR, sel_file))
+        excel_sheet = st.selectbox("Excel sheet", options=xls.sheet_names, index=0)
+    except Exception as e:
+        st.error("Could not read Excel sheets: {}".format(e))
+
+# Load and preview
+df = pd.DataFrame()
+try:
+    df = _load_df(os.path.join(DATA_DIR, sel_file), excel_sheet=excel_sheet)
+except Exception as e:
+    st.error("Failed to load {}: {}".format(sel_file, e))
+
+if df.empty:
+    st.info("No rows to display.")
+    st.stop()
+
+st.markdown("Preview (up to first 500 rows)")
+st.dataframe(df.head(500), use_container_width=True, height=360)
+
+# quick info
+st.markdown("Summary")
+c1, c2, c3 = st.columns(3)
+with c1: st.metric("Rows", len(df))
+with c2: st.metric("Columns", len(df.columns))
+with c3: st.metric("Numeric columns", int(sum(pd.api.types.is_numeric_dtype(df[c]) for c in df.columns)))
+
+# dtypes and nulls
+meta = pd.DataFrame({
+    "column": df.columns,
+    "dtype": [str(df[c].dtype) for c in df.columns],
+    "nulls": [int(df[c].isna().sum()) for c in df.columns],
+    "null_pct": [round(100.0*df[c].isna().mean(), 2) for c in df.columns],
+})
+st.dataframe(meta, use_container_width=True, height=min(300, 40 + 22*max(1, len(meta))))
+
+st.divider()
+st.subheader("Correlation matrix")
+num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+if not num_cols:
+    st.info("No numeric columns in this file.")
 else:
-    sel_name = st.selectbox("Pick a file to analyze", options=[f["name"] for f in files])
-    sel = next((f for f in files if f["name"] == sel_name), None)
+    default_sel = num_cols[: min(8, len(num_cols))]
+    sel_cols = st.multiselect("Select numeric metrics", options=num_cols, default=default_sel)
+    method = st.selectbox("Method", options=["pearson", "spearman", "kendall"], index=0)
+    if st.button("Compute correlation"):
+        if len(sel_cols) < 2:
+            st.warning("Select at least two columns.")
+        else:
+            sub = df[sel_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
+            corr = sub.corr(method=method)
+            st.dataframe(corr, use_container_width=True)
 
-    if sel:
-        ext = "." + sel["type"]
-        path = sel["path"]
-
-        # Preview
-        try:
-            preview_df = _read_preview(path, ext, nrows=100)
-            st.markdown("**Preview (top 100 rows)**")
-            st.dataframe(preview_df, use_container_width=True, height=360)
-        except Exception as e:
-            st.error(f"Preview failed: {e}")
-
-        # Full read for summary & imputation
-        df = None
-        try:
-            df = _read_full(path, ext)
-        except Exception as e:
-            st.error(f"Could not load file for analysis: {e}")
-
-        if df is not None:
-            null_counts = df.isna().sum()
-            null_pct = (df.isna().mean() * 100).round(2)
-            summary = pd.DataFrame({
-                "Column": df.columns,
-                "Datatype": [str(t) for t in df.dtypes],
-                "Null Count": null_counts.values,
-                "Null %": null_pct.values,
-                "Imputation": ["Skip"] * len(df.columns),
-            })
-
-            st.markdown("**Column Summary & Imputation**")
-            edited = st.data_editor(
-                summary,
-                use_container_width=True,
-                height=320,
-                key="summary_editor",
-                column_config={
-                    "Imputation": st.column_config.SelectboxColumn(
-                        "Imputation",
-                        help="Choose how to fill null values for each column",
-                        options=["Skip", "Mean", "Median", "Mode"],
-                        required=True,
-                        default="Skip",
+            # Altair heatmap (no matplotlib dependency)
+            if ALT_AVAILABLE:
+                corr_reset = corr.reset_index().melt(id_vars="index")
+                corr_reset.columns = ["X", "Y", "value"]
+                chart = (
+                    alt.Chart(corr_reset)
+                    .mark_rect()
+                    .encode(
+                        x=alt.X("X:O", title=None),
+                        y=alt.Y("Y:O", title=None),
+                        color=alt.Color("value:Q", scale=alt.Scale(domain=[-1, 1], scheme="redblue")),
+                        tooltip=[alt.Tooltip("X:O"), alt.Tooltip("Y:O"), alt.Tooltip("value:Q", format=".2f")],
                     )
-                },
-                disabled=["Column", "Datatype", "Null Count", "Null %"],
+                    .properties(width=min(60*len(sel_cols), 900), height=min(60*len(sel_cols), 900), title="Correlation ({})".format(method))
+                )
+                labels = (
+                    alt.Chart(corr_reset)
+                    .mark_text(baseline="middle", fontSize=10)
+                    .encode(
+                        x="X:O",
+                        y="Y:O",
+                        text=alt.Text("value:Q", format=".2f"),
+                        color=alt.condition(alt.datum.value < 0, alt.value("#111111"), alt.value("#111111")),
+                    )
+                )
+                st.altair_chart(chart + labels, use_container_width=True)
+            else:
+                st.info("Altair is not available; showing table only.")
+
+            # Download CSV
+            csv_bytes = corr.to_csv(index=True).encode("utf-8")
+            st.download_button(
+                "Download correlation CSV",
+                data=csv_bytes,
+                file_name="{}_correlation.csv".format(os.path.splitext(sel_file)[0]),
+                mime="text/csv",
             )
-
-            st.markdown("**Save as new file**")
-            sc1, sc2, sc3 = st.columns([2, 1, 2])
-            with sc1:
-                new_base = st.text_input("New file name (base)", value=f"{os.path.splitext(sel_name)[0]}_imputed")
-            with sc2:
-                fmt_opts = ["csv"] + (["xlsx"] if HAVE_OPENPYXL else [])
-                fmt = st.selectbox("Format", options=fmt_opts, index=0)
-            with sc3:
-                save_btn = st.button("Apply imputation & Save", type="primary")
-
-            if save_btn:
-                try:
-                    out = df.copy()
-                    for _, row in edited.iterrows():
-                        col = row["Column"]
-                        method = row["Imputation"]
-                        if method not in ("Skip", "Mean", "Median", "Mode"):
-                            method = "Skip"
-                        out[col] = _impute_column(out[col], method)
-
-                    saved_path = _save_new_dataset(out, new_base, to_xlsx=(fmt == "xlsx"))
-                    st.success(f"Saved new dataset: {os.path.basename(saved_path)}")
-                except Exception as e:
-                    st.error(f"Failed to save new dataset: {e}")
-
