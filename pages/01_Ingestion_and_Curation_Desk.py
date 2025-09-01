@@ -1,8 +1,7 @@
-# pages/1_Data
-# Data Upload & File Analyzer (no loops) + Delete ALL
-# - Upload CSV/XLSX, then click "Save uploaded files" (no auto-save)
-# - Refresh files list (button)
-# - Scrollable file inventory with per-file Delete + Delete ALL (guarded)
+# pages/1_Data_Upload.py
+# Data Upload & File Analyzer (no loops) + prominent Delete ALL
+# - Upload CSV/XLSX, Save uploaded files, Refresh files list
+# - Scrollable file inventory with per-file Delete + Delete ALL (guarded, now at top of section)
 # - Analyzer: preview top 100 (10 visible), column summary, per-column impute (Mean/Median/Mode), save new file
 
 import os
@@ -28,7 +27,7 @@ DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
 
 # Session state
-st.session_state.setdefault("_uploaded_hashes", set())  # prevent duplicate writes within session
+st.session_state.setdefault("_uploaded_hashes", set())   # prevent duplicate writes within session
 st.session_state.setdefault("_delete_all_armed", False)  # guard for Delete ALL
 
 # ---------------- Helpers ----------------
@@ -178,10 +177,9 @@ def _save_new_dataset(df: pd.DataFrame, base_name: str, to_xlsx: bool) -> str:
 # ---------------- Upload ----------------
 st.subheader("Upload files (CSV/XLSX)")
 
-allowed_types = ["csv", "xlsx"]  # allow XLSX upload even if openpyxl missing; we block on read/write only
 uploads = st.file_uploader(
     "Choose one or more files",
-    type=allowed_types,
+    type=["csv", "xlsx"],            # allow XLSX upload; read/write guarded later
     accept_multiple_files=True,
     key="uploader_files",
 )
@@ -199,13 +197,10 @@ if save_uploads and uploads:
             buf = bytes(uf.getbuffer())
             h = _file_md5_bytes(buf)
             if h in st.session_state["_uploaded_hashes"]:
-                # same payload already saved in this session
-                continue
+                continue  # same payload already saved this session
             safe = _safe_filename(uf.name)
             dest = os.path.join(DATA_DIR, safe)
-
             if os.path.exists(dest):
-                # if same content on disk, skip; else unique suffix
                 try:
                     if _file_md5_path(dest) == h:
                         st.session_state["_uploaded_hashes"].add(h)
@@ -213,7 +208,6 @@ if save_uploads and uploads:
                 except Exception:
                     pass
                 dest = _unique_path(DATA_DIR, safe)
-
             with open(dest, "wb") as w:
                 w.write(buf)
             st.session_state["_uploaded_hashes"].add(h)
@@ -232,6 +226,38 @@ files = _list_files()
 if not files:
     st.info("No files found yet. Upload and click 'Save uploaded files'.")
 else:
+    # --- Delete ALL controls at the top (always visible when files exist) ---
+    dcol1, dcol2, dcol3 = st.columns([1, 2, 4])
+    with dcol1:
+        if st.button("Delete ALL files", type="secondary"):
+            st.session_state["_delete_all_armed"] = True
+    with dcol2:
+        if st.session_state["_delete_all_armed"]:
+            st.warning("Type **DELETE ALL** to confirm deletion of every file in the data/ folder.")
+            confirm = st.text_input("Confirmation text", key="__confirm_delete_all")
+            ccf1, ccf2 = st.columns(2)
+            with ccf1:
+                if st.button("Confirm full delete"):
+                    if (confirm or "").strip().upper() == "DELETE ALL":
+                        errs = 0
+                        for fn in list(os.listdir(DATA_DIR)):
+                            fp = os.path.join(DATA_DIR, fn)
+                            if os.path.isfile(fp):
+                                try:
+                                    os.remove(fp)
+                                except Exception:
+                                    errs += 1
+                        st.session_state["_delete_all_armed"] = False
+                        if errs == 0:
+                            st.success("All files deleted.")
+                        else:
+                            st.error("Some files could not be deleted.")
+                    else:
+                        st.error("Confirmation text did not match.")
+            with ccf2:
+                if st.button("Cancel"):
+                    st.session_state["_delete_all_armed"] = False
+
     # Build metadata with rows/cols
     meta_rows: List[Dict[str, str]] = []
     for f in files:
@@ -274,39 +300,6 @@ else:
                     st.success(f"Deleted: {row['name']}")
                 except Exception as e:
                     st.error(f"Could not delete {row['name']}: {e}")
-
-    # --- Delete ALL with guard ---
-    st.markdown("**Danger zone**")
-    d1, d2 = st.columns([1, 3])
-    with d1:
-        if st.button("Delete ALL files", type="secondary"):
-            st.session_state["_delete_all_armed"] = True
-    with d2:
-        if st.session_state["_delete_all_armed"]:
-            st.warning("Type **DELETE ALL** to confirm deletion of every file in the data/ folder.")
-            confirm = st.text_input("Confirmation text")
-            dd1, dd2 = st.columns(2)
-            with dd1:
-                if st.button("Confirm full delete"):
-                    if confirm.strip().upper() == "DELETE ALL":
-                        errs = 0
-                        for fn in list(os.listdir(DATA_DIR)):
-                            fp = os.path.join(DATA_DIR, fn)
-                            if os.path.isfile(fp):
-                                try:
-                                    os.remove(fp)
-                                except Exception:
-                                    errs += 1
-                        st.session_state["_delete_all_armed"] = False
-                        if errs == 0:
-                            st.success("All files deleted.")
-                        else:
-                            st.error("Some files could not be deleted.")
-                    else:
-                        st.error("Confirmation text did not match.")
-            with dd2:
-                if st.button("Cancel"):
-                    st.session_state["_delete_all_armed"] = False
 
 st.divider()
 
