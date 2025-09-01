@@ -13,6 +13,7 @@ import math
 import shutil
 import pandas as pd
 import streamlit as st
+from hashlib import md5  # <-- NEW
 
 # ---- If your minimal requirements didn't include Excel support,
 # add this line to requirements.txt: openpyxl>=3.1.2
@@ -56,6 +57,21 @@ def _unique_path(dirpath: str, filename: str) -> str:
         if not os.path.exists(cand):
             return cand
         i += 1
+
+def _file_md5_bytes(b: bytes) -> str:
+    """MD5 for bytes payload."""
+    return md5(b).hexdigest()
+
+def _file_md5_path(path: str, chunk_size: int = 1024 * 1024) -> str:
+    """MD5 for a file on disk."""
+    h = md5()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
 
 def _list_dataset_files():
     files = []
@@ -184,6 +200,10 @@ def _save_new_dataset(df: pd.DataFrame, base_name: str, ext_choice: str) -> str:
 st.set_page_config(page_title="Ingestion & Curation Desk", page_icon="📥", layout="wide")
 st.title("📥 Ingestion & Curation Desk")
 
+# --- Session guard for duplicate uploads in a single session/run cycle ---  (NEW)
+if "_ingested_md5" not in st.session_state:
+    st.session_state["_ingested_md5"] = set()
+
 # ===== 1) Upload files =====
 st.subheader("Upload files (CSV/XLSX)")
 uploads = st.file_uploader("Choose one or more files", type=["csv", "xlsx", "xls"], accept_multiple_files=True)
@@ -192,13 +212,41 @@ if uploads:
     saved_count = 0
     for up in uploads:
         try:
+            # Content hash for deduplication (session-level)
+            buf = bytes(up.getbuffer())
+            h = _file_md5_bytes(buf)
+            if h in st.session_state["_ingested_md5"]:
+                # Already saved this exact content in this session -> skip
+                continue
+
             safe_name = _safe_filename(up.name)
-            dest = _unique_path(DATASETS_DIR, safe_name)
+            dest = os.path.join(DATASETS_DIR, safe_name)
+
+            # If a file of the same name already exists AND has identical content, skip saving
+            if os.path.exists(dest):
+                try:
+                    if _file_md5_path(dest) == h:
+                        # Same name, same content -> do not create _1, _2, ...
+                        st.session_state["_ingested_md5"].add(h)
+                        continue
+                except Exception:
+                    # If hashing existing file fails, fall back to unique path behavior
+                    pass
+
+            # Choose a unique destination only if needed
+            if os.path.exists(dest):
+                dest = _unique_path(DATASETS_DIR, safe_name)
+
+            # Write once
             with open(dest, "wb") as w:
-                w.write(up.getbuffer())
+                w.write(buf)
+
+            st.session_state["_ingested_md5"].add(h)
             saved_count += 1
+
         except Exception as e:
             st.error(f"Failed to save {up.name}: {e}")
+
     if saved_count:
         st.success(f"Uploaded {saved_count} file(s). Refreshing list…")
         st.rerun()
