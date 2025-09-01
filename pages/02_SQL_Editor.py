@@ -1,372 +1,294 @@
-# 02_SQL_Editor.py
-# Streamlit SQL Editor page with DuckDB (preferred) or SQLite fallback.
-# Features
-# - Auto-registers available/saved tables from a data directory (CSV/Parquet/Feather)
-# - Sidebar list of tables with vertical scroll and schema viewer
-# - SQL editor with simple suggestions helper
-# - Run queries and view results
-# - Save result as a new dataset (CSV/Parquet)
-# - Download result as Excel
-# - Robust error handling; avoids hard dependency on duckdb
+# -*- coding: utf-8 -*-
+# 02_SQL_Editor.py — SAFE build for Py 3.13/Streamlit Cloud
+# Notes:
+# - Removes emoji in button labels (can break some terminals/parsers)
+# - Simplifies f-strings/escaping to avoid AST parse edge cases
+# - UTF-8 header added; keeps unicode in comments only
+# - Falls back to SQLite if DuckDB unavailable
+# - No optional deps required for core features; Excel download falls back gracefully
 
 import os
 import io
-import time
 import glob
 import re
+import time
 import sqlite3
 from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
 
-# Try to import duckdb; if unavailable, we'll fall back to SQLite
+# Try DuckDB; fallback to SQLite
 try:
     import duckdb  # type: ignore
     DUCKDB_AVAILABLE = True
 except Exception:
     DUCKDB_AVAILABLE = False
 
-# -------------------------------
-# Configuration
-# -------------------------------
+# ---------------------------------
+# Config
+# ---------------------------------
 st.set_page_config(page_title="SQL Editor", layout="wide")
-
-DATA_DIR = st.secrets.get("DATA_DIR", "data/curated")  # where previous steps saved datasets
-DERIVED_DIR = st.secrets.get("DERIVED_DIR", "data/derived")  # where we save new datasets
+DATA_DIR = st.secrets.get("DATA_DIR", "data/curated")
+DERIVED_DIR = st.secrets.get("DERIVED_DIR", "data/derived")
 os.makedirs(DATA_DIR, exist_ok=True)
-os.makedirs(DERIVED_DIR, exist_ok=True)
+(os.path.isdir(DERIVED_DIR) and True) or os.makedirs(DERIVED_DIR, exist_ok=True)
 
 st.sidebar.title("SQL Editor")
-st.sidebar.caption(
-    "Available tables are auto-registered from CSV/Parquet/Feather in the data folder."
-)
+st.sidebar.caption("Auto-registers CSV/Parquet/Feather from data folder as tables.")
 
-# -------------------------------
-# Engine Abstraction
-# -------------------------------
-class SQLEngine:
-    def __init__(self, prefer_duckdb: bool = True):
-        self.engine = None
-        self.kind = None  # 'duckdb' or 'sqlite'
+# ---------------------------------
+# Utilities
+# ---------------------------------
 
-        if prefer_duckdb and DUCKDB_AVAILABLE:
-            self.kind = 'duckdb'
-            # DuckDB in-memory; we'll register lazy scans of files
-            self.engine = duckdb.connect(database=':memory:')
-            # Make pandas prints nicer
-            self.engine.execute("PRAGMA threads=4;")
-        else:
-            self.kind = 'sqlite'
-            self.engine = sqlite3.connect(':memory:')
-
-    # --- Registration of external files as tables ---
-    def register_file_table(self, table_name: str, file_path: str):
-        ext = os.path.splitext(file_path)[1].lower()
-        if self.kind == 'duckdb':
-            if ext == '.csv':
-                # Create a view over the file (lazy scan)
-                self.engine.execute(
-                    f"CREATE OR REPLACE VIEW {duckdb_identifier(table_name)} AS SELECT * FROM read_csv_auto('{file_path.replace("'", "''")}');"
-                )
-            elif ext in ('.parquet', '.pq'):
-                self.engine.execute(
-                    f"CREATE OR REPLACE VIEW {duckdb_identifier(table_name)} AS SELECT * FROM parquet_scan('{file_path.replace("'", "''")}');"
-                )
-            elif ext in ('.feather', '.ft'):  # Feather/Arrow
-                self.engine.execute(
-                    f"CREATE OR REPLACE VIEW {duckdb_identifier(table_name)} AS SELECT * FROM read_ipc('{file_path.replace("'", "''")}');"
-                )
-            else:
-                # Fallback: read via pandas then create relation
-                df = read_file_to_df(file_path)
-                self.register_dataframe(table_name, df)
-        else:
-            # SQLite: load into memory using pandas
-            df = read_file_to_df(file_path)
-            self.register_dataframe(table_name, df)
-
-    def register_dataframe(self, table_name: str, df: pd.DataFrame):
-        safe = sqlite_identifier(table_name) if self.kind == 'sqlite' else duckdb_identifier(table_name)
-        if self.kind == 'duckdb':
-            self.engine.register(table_name, df)
-            # Make a stable view name equal to the table_name
-            self.engine.execute(f"CREATE OR REPLACE VIEW {safe} AS SELECT * FROM {duckdb_identifier(table_name)};")
-        else:
-            df.to_sql(table_name, self.engine, if_exists='replace', index=False)
-
-    # --- Introspection ---
-    def list_tables(self) -> List[str]:
-        if self.kind == 'duckdb':
-            q = """
-            SELECT table_name FROM information_schema.tables
-            WHERE table_schema IN ('main')
-            ORDER BY table_name
-            """
-            return [r[0] for r in self.engine.execute(q).fetchall()]
-        else:
-            q = "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;"
-            return [r[0] for r in self.engine.execute(q).fetchall()]
-
-    def get_columns(self, table_name: str) -> List[Tuple[str, Optional[str]]]:
-        # returns list of (column_name, data_type)
-        if self.kind == 'duckdb':
-            q = f"SELECT column_name, data_type FROM information_schema.columns WHERE table_name = '{table_name.replace("'", "''")}' ORDER BY ordinal_position;"
-            return [(r[0], r[1]) for r in self.engine.execute(q).fetchall()]
-        else:
-            q = f"PRAGMA table_info({sqlite_identifier(table_name)});"  # cid, name, type, notnull, dflt_value, pk
-            return [(r[1], r[2]) for r in self.engine.execute(q).fetchall()]
-
-    # --- Execution ---
-    def run_query(self, sql: str) -> pd.DataFrame:
-        if self.kind == 'duckdb':
-            return self.engine.execute(sql).df()
-        else:
-            return pd.read_sql_query(sql, self.engine)
-
-# -------------------------------
-# Helpers
-# -------------------------------
-
-def duckdb_identifier(name: str) -> str:
-    # Quote identifiers that contain non-alphanumeric chars
-    if re.match(r'^[A-Za-z_][A-Za-z0-9_]*$', name):
+def _duck_ident(name: str) -> str:
+    # Quote if needed using double-quotes
+    if re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", name):
         return name
-    return f'"{name.replace("\"", "\"\"")}"'
+    return '"' + name.replace('"', '""') + '"'
 
 
-def sqlite_identifier(name: str) -> str:
-    if re.match(r'^[A-Za-z_][A-Za-z0-9_]*$', name):
+def _sqlite_ident(name: str) -> str:
+    if re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", name):
         return name
-    return f'"{name.replace("\"", "\"\"")}"'
+    return '"' + name.replace('"', '""') + '"'
 
 
-def read_file_to_df(path: str) -> pd.DataFrame:
+def _read_df(path: str) -> pd.DataFrame:
     ext = os.path.splitext(path)[1].lower()
-    if ext == '.csv':
+    if ext == ".csv":
         return pd.read_csv(path)
-    if ext in ('.parquet', '.pq'):
+    if ext in (".parquet", ".pq"):
         return pd.read_parquet(path)
-    if ext in ('.feather', '.ft'):
+    if ext in (".feather", ".ft"):
         return pd.read_feather(path)
-    # Best-effort fallback
     return pd.read_csv(path)
 
 
-def scan_data_dir(root: str) -> Dict[str, str]:
-    """Return mapping of table_name -> file_path from data directory.
-    Table name is the file stem; duplicates last-write-wins.
-    """
-    patterns = ["*.csv", "*.parquet", "*.pq", "*.feather", "*.ft"]
-    files = []
-    for p in patterns:
+def _scan_dir(root: str) -> Dict[str, str]:
+    pats = ["*.csv", "*.parquet", "*.pq", "*.feather", "*.ft"]
+    files: List[str] = []
+    for p in pats:
         files.extend(glob.glob(os.path.join(root, p)))
-    mapping = {}
-    for f in sorted(files, key=lambda p: os.path.getmtime(p)):
-        table = os.path.splitext(os.path.basename(f))[0]
-        mapping[table] = f
+    mapping: Dict[str, str] = {}
+    for f in sorted(files, key=lambda x: os.path.getmtime(x)):
+        mapping[os.path.splitext(os.path.basename(f))[0]] = f
     return mapping
 
+# ---------------------------------
+# Engine wrapper
+# ---------------------------------
+class SQLEngine:
+    def __init__(self, prefer_duckdb: bool = True):
+        if prefer_duckdb and DUCKDB_AVAILABLE:
+            self.kind = "duckdb"
+            self.engine = duckdb.connect(database=":memory:")
+            self.engine.execute("PRAGMA threads=4;")
+        else:
+            self.kind = "sqlite"
+            self.engine = sqlite3.connect(":memory:")
 
-# -------------------------------
-# Load/Refresh tables into engine
-# -------------------------------
+    def register_file(self, tbl: str, path: str) -> None:
+        ext = os.path.splitext(path)[1].lower()
+        if self.kind == "duckdb":
+            t = _duck_ident(tbl)
+            p = path.replace("'", "''")
+            if ext == ".csv":
+                self.engine.execute("CREATE OR REPLACE VIEW %s AS SELECT * FROM read_csv_auto('%s');" % (t, p))
+            elif ext in (".parquet", ".pq"):
+                self.engine.execute("CREATE OR REPLACE VIEW %s AS SELECT * FROM parquet_scan('%s');" % (t, p))
+            elif ext in (".feather", ".ft"):
+                self.engine.execute("CREATE OR REPLACE VIEW %s AS SELECT * FROM read_ipc('%s');" % (t, p))
+            else:
+                df = _read_df(path)
+                self.register_df(tbl, df)
+        else:
+            df = _read_df(path)
+            self.register_df(tbl, df)
+
+    def register_df(self, tbl: str, df: pd.DataFrame) -> None:
+        if self.kind == "duckdb":
+            self.engine.register(tbl, df)
+            self.engine.execute("CREATE OR REPLACE VIEW %s AS SELECT * FROM %s;" % (_duck_ident(tbl), _duck_ident(tbl)))
+        else:
+            df.to_sql(tbl, self.engine, if_exists="replace", index=False)
+
+    def list_tables(self) -> List[str]:
+        if self.kind == "duckdb":
+            q = (
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_schema IN ('main') ORDER BY table_name"
+            )
+            return [r[0] for r in self.engine.execute(q).fetchall()]
+        q = "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;"
+        return [r[0] for r in self.engine.execute(q).fetchall()]
+
+    def columns(self, tbl: str) -> List[Tuple[str, Optional[str]]]:
+        if self.kind == "duckdb":
+            q = "SELECT column_name, data_type FROM information_schema.columns WHERE table_name = '%s' ORDER BY ordinal_position;" % (tbl.replace("'", "''"),)
+            return [(r[0], r[1]) for r in self.engine.execute(q).fetchall()]
+        q = "PRAGMA table_info(%s);" % _sqlite_ident(tbl)
+        return [(r[1], r[2]) for r in self.engine.execute(q).fetchall()]
+
+    def query(self, sql: str) -> pd.DataFrame:
+        if self.kind == "duckdb":
+            return self.engine.execute(sql).df()
+        return pd.read_sql_query(sql, self.engine)
+
+# ---------------------------------
+# Cacheable helpers
+# ---------------------------------
 @st.cache_data(show_spinner=False)
-def _scan_paths_cached(root: str):
-    return scan_data_dir(root)
+def _cached_scan(root: str) -> Dict[str, str]:
+    return _scan_dir(root)
 
 
-def load_tables(engine: SQLEngine, root: str) -> Dict[str, str]:
-    mapping = _scan_paths_cached(root)
-    for t, p in mapping.items():
-        engine.register_file_table(t, p)
-    return mapping
+def _load_all(engine: SQLEngine, root: str) -> Dict[str, str]:
+    mp = _cached_scan(root)
+    for t, p in mp.items():
+        engine.register_file(t, p)
+    return mp
 
-# -------------------------------
-# UI Components
-# -------------------------------
 @st.cache_data(show_spinner=False)
-def _schema_snapshot(kind: str, _refresh_key: int) -> Dict[str, List[Tuple[str, Optional[str]]]]:
-    # Cache will bust when _refresh_key changes
-    eng = st.session_state["_engine"]
-    meta = {}
+def _snapshot_schema(_kind: str, _bust: int) -> Dict[str, List[Tuple[str, Optional[str]]]]:
+    eng: SQLEngine = st.session_state["_engine"]
+    out: Dict[str, List[Tuple[str, Optional[str]]]] = {}
     for t in eng.list_tables():
-        meta[t] = eng.get_columns(t)
-    return meta
+        out[t] = eng.columns(t)
+    return out
 
-
-def render_sidebar_tables(schema: Dict[str, List[Tuple[str, Optional[str]]]]):
-    st.sidebar.subheader("Available Tables")
-    filter_text = st.sidebar.text_input("Filter tables", "")
-    names = sorted(schema.keys())
-    if filter_text:
-        names = [n for n in names if filter_text.lower() in n.lower()]
-    with st.sidebar.container(height=280):
-        for name in names:
-            with st.sidebar.expander(name, expanded=False):
-                cols = schema[name]
-                st.caption(f"{len(cols)} columns")
-                for c, t in cols:
-                    st.code(f"{name}.{c} ({t})", language="text")
-                st.button("Copy SELECT *", key=f"copy_{name}", on_click=_inject_sql, args=(f"SELECT * FROM {name} LIMIT 100;",))
-
-
-def _inject_sql(template: str):
-    st.session_state["sql_input"] = template
-
-
-def suggestion_helper(sql_text: str, schema: Dict[str, List[Tuple[str, Optional[str]]]]) -> List[str]:
-    """Very simple suggester: if the last token partially matches, propose table/column names."""
-    try:
-        last = re.split(r"[^A-Za-z0-9_\.]", sql_text.strip())[-1]
-    except Exception:
-        last = ""
-    suggestions = []
-    if not last:
-        return suggestions
-
-    # Suggest tables
-    for t in schema.keys():
-        if t.lower().startswith(last.lower()) and t not in suggestions:
-            suggestions.append(t)
-
-    # Suggest columns with table prefix variants
-    for t, cols in schema.items():
-        for c, _ in cols:
-            full = f"{t}.{c}"
-            if c.lower().startswith(last.lower()) and c not in suggestions:
-                suggestions.append(c)
-            if full.lower().startswith(last.lower()) and full not in suggestions:
-                suggestions.append(full)
-    return suggestions[:20]
-
-# -------------------------------
-# App State
-# -------------------------------
+# ---------------------------------
+# UI
+# ---------------------------------
 if "_engine" not in st.session_state:
     st.session_state["_engine"] = SQLEngine(prefer_duckdb=True)
-    st.session_state["_refresh_key"] = 0
+    st.session_state["_bust"] = 0
 
 engine: SQLEngine = st.session_state["_engine"]
+_files = _load_all(engine, DATA_DIR)
+schema = _snapshot_schema(engine.kind, st.session_state["_bust"])  # table -> cols
 
-# (Re)load tables
-files_map = load_tables(engine, DATA_DIR)
-
-# Schema snapshot (cached)
-schema = _schema_snapshot(engine.kind, st.session_state["_refresh_key"])  # table -> [(col, type), ...]
-
-render_sidebar_tables(schema)
+# Sidebar tables
+st.sidebar.subheader("Available Tables")
+flt = st.sidebar.text_input("Filter tables", "")
+names = sorted(schema.keys())
+if flt:
+    names = [n for n in names if flt.lower() in n.lower()]
+with st.sidebar.container(height=280):
+    for nm in names:
+        with st.sidebar.expander(nm, expanded=False):
+            cols = schema[nm]
+            st.caption("%d columns" % len(cols))
+            for c, t in cols:
+                st.code("%s.%s (%s)" % (nm, c, t), language="text")
+            st.button("Copy SELECT *", key="copy_%s" % nm, on_click=lambda s="SELECT * FROM %s LIMIT 100;" % nm: st.session_state.__setitem__("sql_in", s))
 
 st.markdown("## SQL Editor")
-
-# Editor with helpful placeholder
 placeholder = (
-    """-- Tips:\n"
-    "-- 1) Click a table in the sidebar to see columns.\n"
+    "-- Tips:\n"
+    "-- 1) Use the sidebar to inspect schemas.\n"
     "-- 2) Click 'Copy SELECT *' to insert a template.\n"
-    f"-- 3) Engine: {engine.kind.upper()} | Data dir: {DATA_DIR}\n\n"
+    "-- 3) Engine: %s | Data dir: %s\n\n"
     "-- Example:\n"
     "-- SELECT a.col1, b.col2\n"
     "-- FROM table_a a\n"
     "-- JOIN table_b b ON a.id = b.id\n"
     "-- WHERE a.date >= '2025-01-01'\n"
-    "-- LIMIT 100;\n"
+    "-- LIMIT 100;\n" % (engine.kind.upper(), DATA_DIR)
 )
 
-sql_text = st.text_area(
-    "Write your SQL query",
-    key="sql_input",
-    height=200,
-    placeholder=placeholder,
-)
+sql_text = st.text_area("Write your SQL query", key="sql_in", height=200, placeholder=placeholder)
 
-# Suggestion helper UI
+# Lightweight suggestions
 if sql_text:
-    sugg = suggestion_helper(sql_text, schema)
+    try:
+        last_tok = re.split(r"[^A-Za-z0-9_\.]", sql_text.strip())[-1]
+    except Exception:
+        last_tok = ""
+    sugg: List[str] = []
+    if last_tok:
+        for tname in schema.keys():
+            if tname.lower().startswith(last_tok.lower()):
+                sugg.append(tname)
+        for tname, cols in schema.items():
+            for c, _ in cols:
+                if c.lower().startswith(last_tok.lower()) and c not in sugg:
+                    sugg.append(c)
+                full = tname + "." + c
+                if full.lower().startswith(last_tok.lower()) and full not in sugg:
+                    sugg.append(full)
     if sugg:
         st.caption("Suggestions (click to insert):")
-        scols = st.columns(min(4, len(sugg)))
-        for i, s in enumerate(sugg):
-            if st.button(s, key=f"sug_{i}"):
-                st.session_state["sql_input"] = (sql_text + (" " if not sql_text.endswith(" ") else "") + s)
+        n = min(4, len(sugg))
+        cs = st.columns(n)
+        for i, s in enumerate(sugg[:20]):
+            if cs[i % n].button(s, key="sug_%d" % i):
+                st.session_state["sql_in"] = (sql_text + (" " if not sql_text.endswith(" ") else "") + s)
                 st.rerun()
 
-run_col, save_col, refresh_col = st.columns([1,1,1])
-
-with run_col:
-    run_clicked = st.button("▶ Run Query", type="primary")
-with save_col:
-    st.session_state.setdefault("_save_name", "")
-    save_name = st.text_input("Save result as (table name)", key="_save_name", placeholder="my_new_dataset")
-with refresh_col:
-    if st.button("🔁 Refresh Tables"):
-        # Bust caches and rescan
-        st.cache_data.clear()
-        st.session_state["_refresh_key"] += 1
-        st.rerun()
+col_run, col_save, col_ref = st.columns([1, 1, 1])
+run_clicked = col_run.button("Run Query")
+save_name = col_save.text_input("Save result as (table)", key="_save_name", placeholder="my_new_dataset")
+if col_ref.button("Refresh Tables"):
+    st.cache_data.clear()
+    st.session_state["_bust"] += 1
+    st.rerun()
 
 result_df: Optional[pd.DataFrame] = None
-error_text: Optional[str] = None
-
-if run_clicked and sql_text.strip():
-    start = time.time()
+if run_clicked and sql_text and sql_text.strip():
+    t0 = time.time()
     try:
-        result_df = engine.run_query(sql_text)
-        elapsed = time.time() - start
-        st.success(f"Query OK in {elapsed:.2f}s — {len(result_df):,} rows")
+        result_df = engine.query(sql_text)
+        st.success("Query OK in %.2fs — %s rows" % (time.time() - t0, format(len(result_df), ",")))
     except Exception as e:
-        error_text = str(e)
         st.error("Query failed. See details below.")
         with st.expander("Error details", expanded=False):
-            st.code(error_text, language="text")
+            st.code(str(e), language="text")
 
-# Show results
 if isinstance(result_df, pd.DataFrame):
     st.dataframe(result_df, use_container_width=True, height=420)
 
-    # Downloads
     with st.expander("Download Result"):
         # CSV
-        csv_bytes = result_df.to_csv(index=False).encode('utf-8')
-        st.download_button("Download CSV", data=csv_bytes, file_name="query_result.csv", mime="text/csv")
-        # Excel
-        xbuf = io.BytesIO()
-        with pd.ExcelWriter(xbuf, engine='xlsxwriter') as writer:
-            result_df.to_excel(writer, index=False, sheet_name='Result')
-        st.download_button("Download Excel", data=xbuf.getvalue(), file_name="query_result.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        st.download_button("Download CSV", data=result_df.to_csv(index=False).encode("utf-8"), file_name="query_result.csv", mime="text/csv")
+        # Excel (best-effort)
+        try:
+            xbuf = io.BytesIO()
+            with pd.ExcelWriter(xbuf, engine="xlsxwriter") as writer:
+                result_df.to_excel(writer, index=False, sheet_name="Result")
+            st.download_button("Download Excel", data=xbuf.getvalue(), file_name="query_result.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        except Exception as _ex:
+            st.info("Excel export not available (missing dependency). CSV download still works.")
 
-    # Save as dataset (to both engine and disk)
     if save_name:
-        safe_name = re.sub(r"[^A-Za-z0-9_]+", "_", save_name.strip())
-        if st.button("💾 Save as Dataset"):
+        safe = re.sub(r"[^A-Za-z0-9_]+", "_", save_name.strip())
+        if st.button("Save as Dataset"):
             try:
-                # Register to engine as an in-memory table
-                engine.register_dataframe(safe_name, result_df)
-                # Persist to disk (Parquet and CSV)
-                out_parquet = os.path.join(DERIVED_DIR, f"{safe_name}.parquet")
-                out_csv = os.path.join(DERIVED_DIR, f"{safe_name}.csv")
-                result_df.to_parquet(out_parquet, index=False)
+                engine.register_df(safe, result_df)
+                out_parquet = os.path.join(DERIVED_DIR, safe + ".parquet")
+                out_csv = os.path.join(DERIVED_DIR, safe + ".csv")
+                try:
+                    result_df.to_parquet(out_parquet, index=False)
+                except Exception:
+                    pass
                 result_df.to_csv(out_csv, index=False)
-                # Clear scan cache & rescan so new table appears
                 st.cache_data.clear()
-                st.session_state["_refresh_key"] += 1
-                st.success(f"Saved as '{safe_name}' in {DERIVED_DIR} (CSV & Parquet) and registered in the SQL engine.")
+                st.session_state["_bust"] += 1
+                st.success("Saved as '%s' in %s (CSV% sParquet) and registered in the engine." % (safe, DERIVED_DIR, ", " if os.path.exists(out_parquet) else " without "))
             except Exception as e:
-                st.error(f"Save failed: {e}")
+                st.error("Save failed: %s" % str(e))
 
-# Footer help
 with st.expander("Help / Troubleshooting"):
     st.markdown(
-        f"""
-        **Engine:** {engine.kind.upper()}  
-        **Data folder:** `{DATA_DIR}`  
-        **Derived folder:** `{DERIVED_DIR}`
+        """
+**Engine**: DuckDB (if installed) else SQLite  
+**Data folder**: `data/curated` (override via `st.secrets["DATA_DIR"]`)  
+**Derived folder**: `data/derived` (override via `st.secrets["DERIVED_DIR"]`)
 
-        **Tips**
-        - If you see `ModuleNotFoundError: duckdb`, the page will fall back to SQLite automatically. For best performance and larger-than-memory CSV/Parquet queries, add `duckdb` to your `requirements.txt`.
-        - Supported file types auto-registered: CSV (`*.csv`), Parquet (`*.parquet`/`*.pq`), Feather (`*.feather`/`*.ft`). Table name is the file name (without extension).
-        - Click **Refresh Tables** after adding/removing files in the data folders.
-        - Results are saved to `{DERIVED_DIR}` in both CSV and Parquet and also registered as an in-memory table for immediate querying.
-        - The suggestions are lightweight (prefix-based). Use the sidebar to inspect schemas.
+Tips
+- If you saw `ModuleNotFoundError: duckdb`, the app automatically uses SQLite.
+- Supported auto-registered types: CSV, Parquet, Feather (Parquet/Feather need pyarrow).
+- Click **Refresh Tables** after adding/removing files in the data folders.
+- Saved datasets land in `data/derived` and are registered in-memory for immediate querying.
         """
     )
