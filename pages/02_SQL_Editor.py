@@ -1,9 +1,5 @@
 # pages/02_SQL_Editor.py
-# SQL Editor
-# - Lists available/saved datasets as tables (scrollable)
-# - DuckDB SQL editor to join/transform and create new tables
-# - Suggests table & column names (click to insert into editor)
-# - Show results, save as new dataset, download as Excel
+# SQL Editor with DuckDB (primary) + SQLite/pandasql (fallback)
 
 import os
 import io
@@ -12,20 +8,29 @@ import time
 import pandas as pd
 import streamlit as st
 
-# Soft dependency for Excel support
+# Soft deps for Excel support
 try:
     import openpyxl  # noqa: F401
     HAVE_OPENPYXL = True
 except Exception:
     HAVE_OPENPYXL = False
 
-# Local storage layout (matches your minimal scaffold)
+# Try DuckDB first; fallback to pandasql (SQLite)
+USE_DUCKDB = True
+try:
+    import duckdb  # type: ignore
+except Exception:
+    USE_DUCKDB = False
+    try:
+        from pandasql import sqldf  # type: ignore
+    except Exception:
+        sqldf = None  # will show a clear error
+
 BASE_DIR = os.path.dirname(os.path.dirname(__file__))
 STORAGE_DIR = os.path.join(BASE_DIR, "storage")
 DATASETS_DIR = os.path.join(STORAGE_DIR, "datasets")
 os.makedirs(DATASETS_DIR, exist_ok=True)
 
-# ---------------- Utilities ----------------
 def _human_kb(size_bytes: int) -> float:
     try:
         return round((size_bytes or 0) / 1024.0, 2)
@@ -56,7 +61,6 @@ def _list_dataset_files():
     return files
 
 def _safe_table_name(filename: str) -> str:
-    # Convert a file name to a SQL-safe table name
     name = os.path.splitext(os.path.basename(filename))[0]
     name = re.sub(r"\W+", "_", name).strip("_").lower()
     return name or "table"
@@ -93,14 +97,12 @@ def _save_dataset(df: pd.DataFrame, base_name: str, fmt: str) -> str:
         df.to_excel(dest, index=False)
     return dest
 
-# ---------------- App UI ----------------
 st.set_page_config(page_title="SQL Editor", page_icon="🧮", layout="wide")
 st.title("🧮 SQL Editor")
 
-# Load datasets
 files = _list_dataset_files()
 
-# ===== 1) Available tables =====
+# 1) Available tables
 st.subheader("Available tables")
 if not files:
     st.info("No datasets found. Upload files in the Ingestion & Curation Desk or place CSV/XLSX in ./storage/datasets.")
@@ -117,36 +119,47 @@ else:
     height = 260 if len(meta_rows) > 5 else 180
     st.dataframe(pd.DataFrame(meta_rows), use_container_width=True, height=height)
 
-# ===== 2) Prepare DuckDB engine & register tables =====
-import duckdb  # imported after UI to avoid slowdown before needed
-con = duckdb.connect(database=":memory:")
-
+# 2) Register tables in engine (DuckDB or pandasql env)
 tables_info = {}  # {table: [cols]}
+pandas_env = {}   # for pandasql
+
+if USE_DUCKDB:
+    con = duckdb.connect(database=":memory:")
+else:
+    if sqldf is None:
+        st.error(
+            "SQL engine not available. Install either `duckdb` (recommended) or `pandasql`.\n\n"
+            "Add to requirements.txt:\n  duckdb>=1.0.0\n  pandasql>=0.7.3\n  openpyxl>=3.1.2\n  xlsxwriter>=3.2.0"
+        )
+        st.stop()
+
 for f in files:
     try:
         df = _read_df(f["path"], f["ext"])
         tname = _safe_table_name(f["name"])
-        # Ensure unique table names if duplicates
-        orig = tname
+        # Ensure unique name
+        base = tname
         j = 2
         while tname in tables_info:
-            tname = f"{orig}_{j}"
+            tname = f"{base}_{j}"
             j += 1
-        con.register(tname, df)
         tables_info[tname] = list(map(str, df.columns))
+        if USE_DUCKDB:
+            con.register(tname, df)
+        else:
+            # pandasql uses env variables as table names
+            pandas_env[tname] = df
     except Exception as e:
         st.warning(f"Skipped {f['name']}: {e}")
 
-# ===== 3) Suggestions (click to insert) =====
+# 3) Suggestions panel
 st.subheader("Suggestions")
 with st.expander("Tables & columns (click to insert into editor)", expanded=True):
     if not tables_info:
         st.write("No tables registered.")
     else:
-        # Show as small chips; clicking appends to SQL editor text
         for t, cols in tables_info.items():
             st.markdown(f"**`{t}`**")
-            # Make columns a single line of buttons (chunked)
             chunk = 6
             for i in range(0, len(cols), chunk):
                 row = st.columns(chunk)
@@ -154,14 +167,15 @@ with st.expander("Tables & columns (click to insert into editor)", expanded=True
                     key = f"btn_{t}_{i}_{j}"
                     if row[j].button(col, key=key):
                         st.session_state.setdefault("sql_text", "")
-                        # If not empty and last char not whitespace, add a space
                         sep = "" if not st.session_state["sql_text"] or st.session_state["sql_text"][-1].isspace() else " "
+                        # For pandasql, table.column also works
                         st.session_state["sql_text"] = f"{st.session_state['sql_text']}{sep}{t}.{col}"
 
-# ===== 4) SQL editor =====
+# 4) SQL editor
 st.subheader("Editor")
-default_sql = st.session_state.get("sql_text") or "SELECT * FROM {} LIMIT 100;".format(next(iter(tables_info)) if tables_info else "/*your_table*/")
-sql = st.text_area("Write SQL here", value=default_sql, key="sql_text", height=220, placeholder="SELECT * FROM table_a a JOIN table_b b ON a.id=b.id;")
+default_table = next(iter(tables_info)) if tables_info else "/*your_table*/"
+default_sql = st.session_state.get("sql_text") or f"SELECT * FROM {default_table} LIMIT 100;"
+sql = st.text_area("Write SQL here", value=default_sql, key="sql_text", height=220)
 
 c1, c2, c3 = st.columns([1,1,2])
 with c1:
@@ -175,27 +189,38 @@ if clear:
     st.session_state["sql_text"] = ""
     st.rerun()
 
-if example and tables_info and len(tables_info) >= 2:
+if example and len(tables_info) >= 2:
     tnames = list(tables_info.keys())[:2]
     a, b = tnames[0], tnames[1]
     join_col = tables_info[a][0] if tables_info[a] else "id"
     st.session_state["sql_text"] = f"SELECT a.*, b.*\nFROM {a} a\nJOIN {b} b ON a.{join_col} = b.{join_col}\nLIMIT 100;"
     st.rerun()
 
-# ===== 5) Execute & show results =====
+# 5) Execute & show results
 result_df = None
 if run:
     if not sql.strip():
         st.warning("Enter a SQL statement.")
     else:
         try:
-            result_df = con.execute(sql).df()
+            if USE_DUCKDB:
+                result_df = con.execute(sql).df()
+            else:
+                # pandasql uses local/global env; supply our table dict
+                result_df = sqldf(sql, pandas_env | globals())
             st.success(f"Returned {len(result_df)} rows")
             st.dataframe(result_df, use_container_width=True, height=360)
         except Exception as e:
-            st.error(f"Query failed: {e}")
+            if not USE_DUCKDB:
+                st.error(
+                    f"Query failed under SQLite fallback. "
+                    f"SQLite is less feature-complete than DuckDB (no FULL OUTER JOIN, limited functions). "
+                    f"Error: {e}"
+                )
+            else:
+                st.error(f"Query failed: {e}")
 
-# ===== 6) Save & download =====
+# 6) Save & download
 st.subheader("Save / Download")
 col_a, col_b, col_c = st.columns([2,1,2])
 
@@ -206,13 +231,11 @@ with col_b:
 with col_c:
     save_btn = st.button("Save dataset")
 
-dl_btn = None
 if result_df is not None:
-    # Download as Excel
     xbuf = io.BytesIO()
     with pd.ExcelWriter(xbuf, engine="xlsxwriter") as writer:
         result_df.to_excel(writer, index=False)
-    dl_btn = st.download_button(
+    st.download_button(
         "Download result (Excel)",
         data=xbuf.getvalue(),
         file_name="query_results.xlsx",
