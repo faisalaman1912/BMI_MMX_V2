@@ -1,27 +1,35 @@
 # pages/01_Ingestion_and_Curation_Desk.py
-# Ingestion & Curation Desk
-# - Upload CSV/XLSX (manual save button)
-# - No auto-rerun loops; uses a refresh nonce in session state
-# - Lists files with type, size, modified ts, rows, cols
+# Ingestion & Curation Desk (stable build for Streamlit; no rerun loops)
+# - Manual save for uploads (no auto-refresh)
+# - De-dup by MD5 (session + on-disk) to avoid repeated copies
+# - File list with size, modified, rows, cols
 # - Delete files
-# - File Analyzer: preview top 100, column summary, per-column imputation (Mean/Median/Mode) and save new dataset
+# - Preview, column null summary, per-column imputation (Skip/Mean/Median/Mode)
+# - Save as CSV/XLSX (optional Excel deps handled)
 
 import os
 import io
 import time
+from hashlib import md5
+from typing import Tuple, Optional
+
 import pandas as pd
 import streamlit as st
-from hashlib import md5
 
-# ---- Optional Excel support (recommended)
-# Add to requirements.txt: openpyxl>=3.1.2
+# Optional Excel engines
 try:
-    import openpyxl  # noqa: F401
+    import openpyxl  # for .xlsx read/write
     HAVE_OPENPYXL = True
 except Exception:
     HAVE_OPENPYXL = False
 
-# ---- Storage paths
+try:
+    import xlrd  # for .xls read
+    HAVE_XLRD = True
+except Exception:
+    HAVE_XLRD = False
+
+# ---------------- Paths ----------------
 BASE_DIR = os.path.dirname(os.path.dirname(__file__))
 STORAGE_DIR = os.path.join(BASE_DIR, "storage")
 DATASETS_DIR = os.path.join(STORAGE_DIR, "datasets")
@@ -29,18 +37,21 @@ MODELS_DIR = os.path.join(STORAGE_DIR, "models")
 os.makedirs(DATASETS_DIR, exist_ok=True)
 os.makedirs(MODELS_DIR, exist_ok=True)
 
-# ---------------- Helper functions ----------------
+# ---------------- Helpers ----------------
+
 def _human_kb(size_bytes: int) -> float:
     try:
         return round((size_bytes or 0) / 1024.0, 2)
     except Exception:
         return 0.0
 
+
 def _safe_filename(name: str) -> str:
     base, ext = os.path.splitext(name)
     safe_base = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in base).strip("_")
     ext = ext if ext.lower() in (".csv", ".xlsx", ".xls") else ext
     return (safe_base or "dataset") + ext
+
 
 def _unique_path(dirpath: str, filename: str) -> str:
     candidate = os.path.join(dirpath, filename)
@@ -54,8 +65,10 @@ def _unique_path(dirpath: str, filename: str) -> str:
             return cand
         i += 1
 
+
 def _file_md5_bytes(b: bytes) -> str:
     return md5(b).hexdigest()
+
 
 def _file_md5_path(path: str, chunk_size: int = 1024 * 1024) -> str:
     h = md5()
@@ -66,6 +79,7 @@ def _file_md5_path(path: str, chunk_size: int = 1024 * 1024) -> str:
                 break
             h.update(chunk)
     return h.hexdigest()
+
 
 def _list_dataset_files():
     files = []
@@ -83,65 +97,64 @@ def _list_dataset_files():
                 "path": full,
                 "type": ext.strip("."),
                 "size_kb": _human_kb(stat.st_size),
-                "modified_ts": int(stat.st_mtime)
+                "modified_ts": int(stat.st_mtime),
             })
         except Exception:
             pass
     files.sort(key=lambda x: x["modified_ts"], reverse=True)
     return files
 
-def _quick_shape(path: str, ext: str):
-    """Return (rows, cols) with best-effort speed, fallback to pandas."""
+
+def _excel_support_check(ext: str):
+    if ext == ".xlsx" and not HAVE_OPENPYXL:
+        raise RuntimeError(".xlsx requires openpyxl>=3.1.2. Add to requirements.txt.")
+    if ext == ".xls" and not HAVE_XLRD:
+        raise RuntimeError(".xls requires xlrd==1.2.0 (or compatible). Add to requirements.txt.")
+
+
+def _read_preview(path: str, ext: str, nrows: int = 100) -> pd.DataFrame:
+    if ext == ".csv":
+        return pd.read_csv(path, nrows=nrows)
+    _excel_support_check(ext)
+    engine = "openpyxl" if ext == ".xlsx" else "xlrd"
+    return pd.read_excel(path, nrows=nrows, engine=engine)
+
+
+def _read_full(path: str, ext: str) -> pd.DataFrame:
+    if ext == ".csv":
+        return pd.read_csv(path)
+    _excel_support_check(ext)
+    engine = "openpyxl" if ext == ".xlsx" else "xlrd"
+    return pd.read_excel(path, engine=engine)
+
+
+def _quick_shape(path: str, ext: str) -> Tuple[Optional[int], Optional[int]]:
+    """Return (rows, cols) fast when possible; fallback to full read."""
     try:
         if ext == ".csv":
-            # Header for columns
             with open(path, "r", encoding="utf-8", errors="ignore") as f:
                 header = f.readline()
             cols = len(pd.read_csv(io.StringIO(header), nrows=0).columns) if header else 0
-            # Count lines efficiently
             with open(path, "rb") as fb:
                 row_lines = sum(1 for _ in fb)
             rows = max(row_lines - 1, 0)
             return rows, cols
-        elif ext in (".xlsx", ".xls"):
-            if HAVE_OPENPYXL and ext == ".xlsx":
-                wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
-                ws = wb.active
-                rows = max((ws.max_row or 1) - 1, 0)  # minus header
-                cols = ws.max_column or 0
-                return rows, cols
-            # Fallback to pandas
-            df0 = pd.read_excel(path, nrows=0)
+        if ext in (".xlsx", ".xls"):
+            _excel_support_check(ext)
+            # Fallback to fast-ish pandas scan
+            df0 = pd.read_excel(path, nrows=0, engine=("openpyxl" if ext == ".xlsx" else "xlrd"))
             cols = len(df0.columns)
-            df = pd.read_excel(path, usecols=list(df0.columns))
+            df = pd.read_excel(path, usecols=list(df0.columns), engine=("openpyxl" if ext == ".xlsx" else "xlrd"))
             rows = len(df)
             return rows, cols
     except Exception:
         pass
     try:
-        if ext == ".csv":
-            df = pd.read_csv(path)
-        else:
-            df = pd.read_excel(path)
+        df = _read_full(path, ext)
         return df.shape[0], df.shape[1]
     except Exception:
         return None, None
 
-def _read_preview(path: str, ext: str, nrows: int = 100) -> pd.DataFrame:
-    if ext == ".csv":
-        return pd.read_csv(path, nrows=nrows)
-    else:
-        if not HAVE_OPENPYXL and ext == ".xlsx":
-            raise RuntimeError("Excel preview requires 'openpyxl'. Add openpyxl>=3.1.2 to requirements.txt.")
-        return pd.read_excel(path, nrows=nrows)
-
-def _read_full(path: str, ext: str) -> pd.DataFrame:
-    if ext == ".csv":
-        return pd.read_csv(path)
-    else:
-        if not HAVE_OPENPYXL and ext == ".xlsx":
-            raise RuntimeError("Reading Excel requires 'openpyxl'. Add openpyxl>=3.1.2 to requirements.txt.")
-        return pd.read_excel(path)
 
 def _impute_column(series: pd.Series, method: str) -> pd.Series:
     if method == "Skip":
@@ -168,6 +181,7 @@ def _impute_column(series: pd.Series, method: str) -> pd.Series:
         return series.fillna(fill_val)
     return series
 
+
 def _save_new_dataset(df: pd.DataFrame, base_name: str, ext_choice: str) -> str:
     base_name = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in base_name).strip("_") or "dataset_imputed"
     filename = f"{base_name}.{ext_choice}"
@@ -176,32 +190,39 @@ def _save_new_dataset(df: pd.DataFrame, base_name: str, ext_choice: str) -> str:
         df.to_csv(dest, index=False)
     else:
         if not HAVE_OPENPYXL:
-            raise RuntimeError("Writing Excel requires 'openpyxl'. Add openpyxl>=3.1.2 to requirements.txt.")
+            raise RuntimeError("Writing .xlsx requires openpyxl>=3.1.2. Add to requirements.txt.")
         df.to_excel(dest, index=False)
     return dest
 
 # ---------------- UI ----------------
-st.set_page_config(page_title="Ingestion & Curation Desk", page_icon="📥", layout="wide")
-st.title("📥 Ingestion & Curation Desk")
+st.set_page_config(page_title="Ingestion & Curation Desk", layout="wide")
+st.title("Ingestion & Curation Desk")
 
-# Session guards
-st.session_state.setdefault("_ingested_md5", set())     # uploaded content hashes this session
-st.session_state.setdefault("__refresh_nonce", 0)       # one-time refresh flag
+# Session state
+st.session_state.setdefault("_ingested_md5", set())
+st.session_state.setdefault("_uploader_nonce", 0)
 
 # ===== 1) Upload files =====
 st.subheader("Upload files (CSV/XLSX)")
+uploader_key = f"uploader_files_{st.session_state['_uploader_nonce']}"
 uploads = st.file_uploader(
     "Choose one or more files",
     type=["csv", "xlsx", "xls"],
     accept_multiple_files=True,
-    key="uploader_files"
+    key=uploader_key,
 )
 
-col_up1, col_up2 = st.columns([1, 1])
-with col_up1:
+c_up1, c_up2, c_up3 = st.columns([1, 1, 1])
+with c_up1:
     save_uploads = st.button("Save uploaded files", type="primary")
-with col_up2:
+with c_up2:
     refresh_files = st.button("Refresh files list")
+with c_up3:
+    clear_selected = st.button("Clear selected files")
+
+if clear_selected:
+    # Change uploader key to reset selection without rerun loops
+    st.session_state["_uploader_nonce"] += 1
 
 if save_uploads and uploads:
     saved_count = 0
@@ -210,7 +231,7 @@ if save_uploads and uploads:
             buf = bytes(up.getbuffer())
             h = _file_md5_bytes(buf)
             if h in st.session_state["_ingested_md5"]:
-                # Same payload already saved this session -> skip
+                # Already saved this content this session
                 continue
 
             safe_name = _safe_filename(up.name)
@@ -219,12 +240,10 @@ if save_uploads and uploads:
             if os.path.exists(dest):
                 try:
                     if _file_md5_path(dest) == h:
-                        # Same filename and same content on disk -> skip saving
                         st.session_state["_ingested_md5"].add(h)
                         continue
                 except Exception:
                     pass
-                # Different content for same name -> use unique suffix
                 dest = _unique_path(DATASETS_DIR, safe_name)
 
             with open(dest, "wb") as w:
@@ -234,22 +253,19 @@ if save_uploads and uploads:
             saved_count += 1
         except Exception as e:
             st.error(f"Failed to save {up.name}: {e}")
-
     if saved_count:
-        st.success(f"Uploaded {saved_count} file(s).")
-        st.session_state["__refresh_nonce"] += 1  # trigger one-time listing refresh
+        st.success(f"Uploaded {saved_count} file(s). Use 'Refresh files list' if needed.")
 
-if refresh_files:
-    st.session_state["__refresh_nonce"] += 1
+# Note: Pressing any Streamlit button already causes a rerun → the listing below
+# will reflect latest state. No explicit rerun/nonce required.
 
 st.divider()
 
 # ===== 2) Files list with delete =====
 st.subheader("Available files")
-_ = st.session_state.get("__refresh_nonce", 0)  # bind table to refresh nonce (no rerun loops)
 files = _list_dataset_files()
 
-# Prepare metadata table with rows/cols
+# Build metadata table
 meta_rows = []
 for f in files:
     rows, cols = _quick_shape(f["path"], "." + f["type"])
@@ -262,22 +278,23 @@ for f in files:
         "Total Columns": cols if cols is not None else "",
     })
 
-table_height = 320 if len(files) > 5 else (180 if len(files) else 120)
-st.dataframe(pd.DataFrame(meta_rows), use_container_width=True, height=table_height)
+height = 320 if len(files) > 5 else (180 if len(files) else 120)
+st.dataframe(pd.DataFrame(meta_rows), use_container_width=True, height=height)
 
-col_del1, col_del2 = st.columns([3, 1])
-with col_del1:
+c_del1, c_del2 = st.columns([3, 1])
+with c_del1:
     del_choice = st.selectbox("Delete a file", options=["-- Select --"] + [f["name"] for f in files])
-with col_del2:
-    if st.button("Delete", type="secondary", disabled=(del_choice == "-- Select --")):
-        target = next((f for f in files if f["name"] == del_choice), None)
-        if target:
-            try:
-                os.remove(target["path"])
-                st.warning(f"Deleted: {del_choice}")
-                st.session_state["__refresh_nonce"] += 1  # manual refresh
-            except Exception as e:
-                st.error(f"Could not delete {del_choice}: {e}")
+with c_del2:
+    do_delete = st.button("Delete", disabled=(del_choice == "-- Select --"))
+
+if do_delete:
+    target = next((f for f in files if f["name"] == del_choice), None)
+    if target:
+        try:
+            os.remove(target["path"])
+            st.warning(f"Deleted: {del_choice}")
+        except Exception as e:
+            st.error(f"Could not delete {del_choice}: {e}")
 
 st.divider()
 
@@ -310,7 +327,6 @@ else:
             st.error(f"Could not load file for analysis: {e}")
 
         if df is not None:
-            # Column summary
             null_counts = df.isna().sum()
             null_pct = (df.isna().mean() * 100).round(2)
             summary = pd.DataFrame({
@@ -318,7 +334,7 @@ else:
                 "Datatype": [str(t) for t in df.dtypes],
                 "Null Count": null_counts.values,
                 "Null %": null_pct.values,
-                "Imputation": ["Skip"] * len(df.columns)
+                "Imputation": ["Skip"] * len(df.columns),
             })
 
             st.markdown("**Column Summary & Imputation**")
@@ -340,15 +356,15 @@ else:
             )
 
             st.markdown("**Save as new file**")
-            c1, c2, c3 = st.columns([2, 1, 2])
-            with c1:
+            sc1, sc2, sc3 = st.columns([2, 1, 2])
+            with sc1:
                 new_base = st.text_input("New file name (base)", value=f"{os.path.splitext(sel_name)[0]}_imputed")
-            with c2:
+            with sc2:
                 ext_choice = st.selectbox("Format", options=["csv", "xlsx"], index=0)
-            with c3:
-                btn = st.button("Apply imputation & Save", type="primary")
+            with sc3:
+                save_btn = st.button("Apply imputation & Save", type="primary")
 
-            if btn:
+            if save_btn:
                 try:
                     out = df.copy()
                     for _, row in edited.iterrows():
@@ -360,6 +376,5 @@ else:
 
                     saved_path = _save_new_dataset(out, new_base, ext_choice)
                     st.success(f"Saved new dataset: {os.path.basename(saved_path)}")
-                    st.session_state["__refresh_nonce"] += 1  # manual refresh
                 except Exception as e:
                     st.error(f"Failed to save new dataset: {e}")
