@@ -1,9 +1,12 @@
 # pages/1_Data_Upload.py
-# v1.7.0  Upload, delete, inspect, and correlation (Altair heatmap; no matplotlib needed)
+# v1.7.1  Upload, delete, inspect, and correlation (Altair heatmap; no matplotlib needed)
+# - Keeps original functionality
+# - Removes st.rerun() loops that can cause repeated uploads/deletes
+# - Adds safe Excel engine handling (openpyxl), without changing behavior for CSV
 
 import os
 from datetime import datetime
-from typing import List, Dict
+from typing import List, Dict, Optional
 
 import numpy as np
 import pandas as pd
@@ -16,14 +19,20 @@ try:
 except Exception:
     ALT_AVAILABLE = False
 
+# Optional Excel engine for .xlsx
+try:
+    import openpyxl  # noqa: F401
+    HAVE_OPENPYXL = True
+except Exception:
+    HAVE_OPENPYXL = False
+
 st.title("Data Upload")
 
 DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
 
 # Ensure guard state exists
-if "delete_all_guard" not in st.session_state:
-    st.session_state["delete_all_guard"] = False
+st.session_state.setdefault("delete_all_guard", False)
 
 # ---------------- Helpers ----------------
 def _human_size(n: int) -> str:
@@ -37,15 +46,17 @@ def _human_size(n: int) -> str:
 def _list_files() -> List[str]:
     return sorted([f for f in os.listdir(DATA_DIR) if f.lower().endswith((".csv", ".xlsx"))])
 
-def _load_df(path: str, excel_sheet: str = None) -> pd.DataFrame:
+def _load_df(path: str, excel_sheet: Optional[str] = None) -> pd.DataFrame:
     if path.lower().endswith(".csv"):
         return pd.read_csv(path)
-    else:
-        if excel_sheet is None:
-            xls = pd.ExcelFile(path)
-            sheet = xls.sheet_names[0]
-            return pd.read_excel(path, sheet_name=sheet)
-        return pd.read_excel(path, sheet_name=excel_sheet)
+    # .xlsx handling (same functionality; explicit engine for stability)
+    if not HAVE_OPENPYXL:
+        raise RuntimeError("Reading XLSX requires 'openpyxl'. Add openpyxl>=3.1.2 or use CSV.")
+    if excel_sheet is None:
+        xls = pd.ExcelFile(path, engine="openpyxl")
+        sheet = xls.sheet_names[0]
+        return pd.read_excel(path, sheet_name=sheet, engine="openpyxl")
+    return pd.read_excel(path, sheet_name=excel_sheet, engine="openpyxl")
 
 # Cross-page save banners (from Modeling/Advanced/Results)
 if st.session_state.get("last_saved_path"):
@@ -58,12 +69,13 @@ st.subheader("Upload files")
 uploaded = st.file_uploader(
     "Upload CSV or Excel files", type=["csv", "xlsx"], accept_multiple_files=True
 )
+
 if uploaded:
     saved = 0
     for uf in uploaded:
         try:
             dest = os.path.join(DATA_DIR, uf.name)
-            # Overwrite if exists to keep things simple/explicit
+            # Overwrite if exists to keep things simple/explicit (same behavior)
             with open(dest, "wb") as f:
                 f.write(uf.getbuffer())
             saved += 1
@@ -71,7 +83,7 @@ if uploaded:
             st.error("Failed to save {}: {}".format(uf.name, e))
     if saved:
         st.success("Uploaded {} file(s) to data/".format(saved))
-        st.rerun()
+        # No st.rerun(): Streamlit already re-executes on button/widget interaction.
 
 # ---------------- Inventory + Delete ----------------
 st.subheader("Files in data/")
@@ -92,10 +104,11 @@ else:
             })
         except Exception:
             rows.append({"File": fn, "Type": "?", "Size": "?", "Modified": "?"})
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, height=min(360, 40 + 38*max(1, len(rows))))
+    st.dataframe(pd.DataFrame(rows), use_container_width=True,
+                 height=min(360, 40 + 38*max(1, len(rows))))
 
     del_sel = st.multiselect("Select files to delete", options=files)
-    c1, c2, c3 = st.columns([1,1,3])
+    c1, c2, c3 = st.columns([1, 1, 3])
     with c1:
         if st.button("Delete selected"):
             if not del_sel:
@@ -111,7 +124,8 @@ else:
                         st.error("Could not delete {}: {}".format(fn, e))
                 if deleted:
                     st.success("Deleted {} file(s).".format(deleted))
-                st.rerun()
+                # No st.rerun(): the UI will rerun naturally on this button click.
+
     with c2:
         if st.button("Delete ALL (guarded)"):
             st.session_state["delete_all_guard"] = True
@@ -134,13 +148,11 @@ else:
                         st.success("All files deleted.")
                     else:
                         st.error("Some files could not be deleted.")
-                    st.rerun()
                 else:
                     st.error("Confirmation text did not match.")
         with cR:
             if st.button("Cancel"):
                 st.session_state["delete_all_guard"] = False
-                st.rerun()
 
 # ---------------- Inspect and Correlation ----------------
 st.subheader("Inspect a file")
@@ -154,7 +166,9 @@ sel_file = st.selectbox("Choose a file", options=files, index=0)
 excel_sheet = None
 if sel_file.lower().endswith(".xlsx"):
     try:
-        xls = pd.ExcelFile(os.path.join(DATA_DIR, sel_file))
+        if not HAVE_OPENPYXL:
+            raise RuntimeError("Reading XLSX requires 'openpyxl'. Add openpyxl>=3.1.2.")
+        xls = pd.ExcelFile(os.path.join(DATA_DIR, sel_file), engine="openpyxl")
         excel_sheet = st.selectbox("Excel sheet", options=xls.sheet_names, index=0)
     except Exception as e:
         st.error("Could not read Excel sheets: {}".format(e))
@@ -176,18 +190,22 @@ st.dataframe(df.head(500), use_container_width=True, height=360)
 # quick info
 st.markdown("Summary")
 c1, c2, c3 = st.columns(3)
-with c1: st.metric("Rows", len(df))
-with c2: st.metric("Columns", len(df.columns))
-with c3: st.metric("Numeric columns", int(sum(pd.api.types.is_numeric_dtype(df[c]) for c in df.columns)))
+with c1:
+    st.metric("Rows", len(df))
+with c2:
+    st.metric("Columns", len(df.columns))
+with c3:
+    st.metric("Numeric columns", int(sum(pd.api.types.is_numeric_dtype(df[c]) for c in df.columns)))
 
 # dtypes and nulls
 meta = pd.DataFrame({
     "column": df.columns,
     "dtype": [str(df[c].dtype) for c in df.columns],
     "nulls": [int(df[c].isna().sum()) for c in df.columns],
-    "null_pct": [round(100.0*df[c].isna().mean(), 2) for c in df.columns],
+    "null_pct": [round(100.0 * df[c].isna().mean(), 2) for c in df.columns],
 })
-st.dataframe(meta, use_container_width=True, height=min(300, 40 + 22*max(1, len(meta))))
+st.dataframe(meta, use_container_width=True,
+             height=min(300, 40 + 22*max(1, len(meta))))
 
 st.divider()
 st.subheader("Correlation matrix")
@@ -219,7 +237,11 @@ else:
                         color=alt.Color("value:Q", scale=alt.Scale(domain=[-1, 1], scheme="redblue")),
                         tooltip=[alt.Tooltip("X:O"), alt.Tooltip("Y:O"), alt.Tooltip("value:Q", format=".2f")],
                     )
-                    .properties(width=min(60*len(sel_cols), 900), height=min(60*len(sel_cols), 900), title="Correlation ({})".format(method))
+                    .properties(
+                        width=min(60 * len(sel_cols), 900),
+                        height=min(60 * len(sel_cols), 900),
+                        title="Correlation ({})".format(method),
+                    )
                 )
                 labels = (
                     alt.Chart(corr_reset)
