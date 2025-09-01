@@ -1,30 +1,27 @@
 # pages/01_Ingestion_and_Curation_Desk.py
 # Ingestion & Curation Desk
-# - Upload CSV/XLSX
-# - Auto-refresh file list with type, size, modified ts, rows, cols
+# - Upload CSV/XLSX (manual save button)
+# - No auto-rerun loops; uses a refresh nonce in session state
+# - Lists files with type, size, modified ts, rows, cols
 # - Delete files
-# - File Analyzer: preview top 100 (10 rows visible), column summary,
-#   per-column imputation (Mean/Median/Mode) and save as a new dataset
+# - File Analyzer: preview top 100, column summary, per-column imputation (Mean/Median/Mode) and save new dataset
 
 import os
 import io
 import time
-import math
-import shutil
 import pandas as pd
 import streamlit as st
-from hashlib import md5  # <-- NEW
+from hashlib import md5
 
-# ---- If your minimal requirements didn't include Excel support,
-# add this line to requirements.txt: openpyxl>=3.1.2
+# ---- Optional Excel support (recommended)
+# Add to requirements.txt: openpyxl>=3.1.2
 try:
     import openpyxl  # noqa: F401
     HAVE_OPENPYXL = True
 except Exception:
     HAVE_OPENPYXL = False
 
-# ---- Paths (reuse storage layout from the minimal scaffold)
-# If you used `utils/catalog.py` from the minimal setup, these dirs match that structure.
+# ---- Storage paths
 BASE_DIR = os.path.dirname(os.path.dirname(__file__))
 STORAGE_DIR = os.path.join(BASE_DIR, "storage")
 DATASETS_DIR = os.path.join(STORAGE_DIR, "datasets")
@@ -40,7 +37,6 @@ def _human_kb(size_bytes: int) -> float:
         return 0.0
 
 def _safe_filename(name: str) -> str:
-    # Remove unsafe characters but keep file extension if present
     base, ext = os.path.splitext(name)
     safe_base = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in base).strip("_")
     ext = ext if ext.lower() in (".csv", ".xlsx", ".xls") else ext
@@ -59,11 +55,9 @@ def _unique_path(dirpath: str, filename: str) -> str:
         i += 1
 
 def _file_md5_bytes(b: bytes) -> str:
-    """MD5 for bytes payload."""
     return md5(b).hexdigest()
 
 def _file_md5_path(path: str, chunk_size: int = 1024 * 1024) -> str:
-    """MD5 for a file on disk."""
     h = md5()
     with open(path, "rb") as f:
         while True:
@@ -92,20 +86,15 @@ def _list_dataset_files():
                 "modified_ts": int(stat.st_mtime)
             })
         except Exception:
-            # Ignore unreadable files but do not crash UI
             pass
-    # Sort newest first
     files.sort(key=lambda x: x["modified_ts"], reverse=True)
     return files
 
 def _quick_shape(path: str, ext: str):
-    """
-    Return (rows, cols) without loading entire file wherever possible.
-    Fallback to pandas for reliability.
-    """
+    """Return (rows, cols) with best-effort speed, fallback to pandas."""
     try:
         if ext == ".csv":
-            # Columns by header, rows by line count - 1 (header)
+            # Header for columns
             with open(path, "r", encoding="utf-8", errors="ignore") as f:
                 header = f.readline()
             cols = len(pd.read_csv(io.StringIO(header), nrows=0).columns) if header else 0
@@ -129,7 +118,6 @@ def _quick_shape(path: str, ext: str):
             return rows, cols
     except Exception:
         pass
-    # Last resort
     try:
         if ext == ".csv":
             df = pd.read_csv(path)
@@ -159,11 +147,9 @@ def _impute_column(series: pd.Series, method: str) -> pd.Series:
     if method == "Skip":
         return series
     if method == "Mean":
-        # Mean only for numeric; fallback to Mode if non-numeric or NaN mean
         s_num = pd.to_numeric(series, errors="coerce")
         mean_val = s_num.mean()
         if pd.isna(mean_val):
-            # fallback to mode
             mode_vals = series.mode(dropna=True)
             fill_val = mode_vals.iloc[0] if not mode_vals.empty else ""
             return series.fillna(fill_val)
@@ -180,7 +166,6 @@ def _impute_column(series: pd.Series, method: str) -> pd.Series:
         mode_vals = series.mode(dropna=True)
         fill_val = mode_vals.iloc[0] if not mode_vals.empty else ""
         return series.fillna(fill_val)
-    # default: skip
     return series
 
 def _save_new_dataset(df: pd.DataFrame, base_name: str, ext_choice: str) -> str:
@@ -190,7 +175,6 @@ def _save_new_dataset(df: pd.DataFrame, base_name: str, ext_choice: str) -> str:
     if ext_choice == "csv":
         df.to_csv(dest, index=False)
     else:
-        # ensure openpyxl present to write xlsx
         if not HAVE_OPENPYXL:
             raise RuntimeError("Writing Excel requires 'openpyxl'. Add openpyxl>=3.1.2 to requirements.txt.")
         df.to_excel(dest, index=False)
@@ -200,9 +184,9 @@ def _save_new_dataset(df: pd.DataFrame, base_name: str, ext_choice: str) -> str:
 st.set_page_config(page_title="Ingestion & Curation Desk", page_icon="📥", layout="wide")
 st.title("📥 Ingestion & Curation Desk")
 
-# --- Session guard for duplicate uploads in a single session/run cycle ---  (NEW)
-if "_ingested_md5" not in st.session_state:
-    st.session_state["_ingested_md5"] = set()
+# Session guards
+st.session_state.setdefault("_ingested_md5", set())     # uploaded content hashes this session
+st.session_state.setdefault("__refresh_nonce", 0)       # one-time refresh flag
 
 # ===== 1) Upload files =====
 st.subheader("Upload files (CSV/XLSX)")
@@ -223,23 +207,46 @@ if save_uploads and uploads:
     saved_count = 0
     for up in uploads:
         try:
+            buf = bytes(up.getbuffer())
+            h = _file_md5_bytes(buf)
+            if h in st.session_state["_ingested_md5"]:
+                # Same payload already saved this session -> skip
+                continue
+
             safe_name = _safe_filename(up.name)
             dest = os.path.join(DATASETS_DIR, safe_name)
+
             if os.path.exists(dest):
+                try:
+                    if _file_md5_path(dest) == h:
+                        # Same filename and same content on disk -> skip saving
+                        st.session_state["_ingested_md5"].add(h)
+                        continue
+                except Exception:
+                    pass
+                # Different content for same name -> use unique suffix
                 dest = _unique_path(DATASETS_DIR, safe_name)
+
             with open(dest, "wb") as w:
-                w.write(up.getbuffer())
+                w.write(buf)
+
+            st.session_state["_ingested_md5"].add(h)
             saved_count += 1
         except Exception as e:
             st.error(f"Failed to save {up.name}: {e}")
-    if saved_count:
-        st.success(f"Uploaded {saved_count} file(s). Use 'Refresh files list' to see them below.")
 
-# Manual refresh of the table (user-triggered)
+    if saved_count:
+        st.success(f"Uploaded {saved_count} file(s).")
+        st.session_state["__refresh_nonce"] += 1  # trigger one-time listing refresh
+
 if refresh_files:
-    st.rerun()
+    st.session_state["__refresh_nonce"] += 1
+
+st.divider()
+
 # ===== 2) Files list with delete =====
 st.subheader("Available files")
+_ = st.session_state.get("__refresh_nonce", 0)  # bind table to refresh nonce (no rerun loops)
 files = _list_dataset_files()
 
 # Prepare metadata table with rows/cols
@@ -268,7 +275,7 @@ with col_del2:
             try:
                 os.remove(target["path"])
                 st.warning(f"Deleted: {del_choice}")
-                st.rerun()
+                st.session_state["__refresh_nonce"] += 1  # manual refresh
             except Exception as e:
                 st.error(f"Could not delete {del_choice}: {e}")
 
@@ -287,7 +294,7 @@ else:
         ext = "." + sel["type"]
         path = sel["path"]
 
-        # Preview (top 100 rows) with ~10 visible rows height
+        # Preview (top 100 rows)
         try:
             preview_df = _read_preview(path, ext, nrows=100)
             st.markdown("**Preview (top 100 rows)**")
@@ -353,6 +360,6 @@ else:
 
                     saved_path = _save_new_dataset(out, new_base, ext_choice)
                     st.success(f"Saved new dataset: {os.path.basename(saved_path)}")
-                    st.rerun()
+                    st.session_state["__refresh_nonce"] += 1  # manual refresh
                 except Exception as e:
                     st.error(f"Failed to save new dataset: {e}")
