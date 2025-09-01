@@ -1,0 +1,7 @@
+
+[server]
+enableXsrfProtection = true
+enableCORS = true
+
+[theme]
+base = "light"
