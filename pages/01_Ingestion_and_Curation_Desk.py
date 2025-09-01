@@ -1,8 +1,8 @@
 # pages/1_Data_Upload.py
-# Data Upload & File Analyzer (no loops)
+# Data Upload & File Analyzer (no loops) + Delete ALL
 # - Upload CSV/XLSX, then click "Save uploaded files" (no auto-save)
 # - Refresh files list (button)
-# - Scrollable file inventory with per-file Delete
+# - Scrollable file inventory with per-file Delete + Delete ALL (guarded)
 # - Analyzer: preview top 100 (10 visible), column summary, per-column impute (Mean/Median/Mode), save new file
 
 import os
@@ -29,6 +29,7 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 # Session state
 st.session_state.setdefault("_uploaded_hashes", set())  # prevent duplicate writes within session
+st.session_state.setdefault("_delete_all_armed", False)  # guard for Delete ALL
 
 # ---------------- Helpers ----------------
 def _human_size(n: int) -> str:
@@ -224,7 +225,7 @@ if save_uploads and uploads:
 
 st.divider()
 
-# ---------------- Inventory (scrollable if >5) + Delete ----------------
+# ---------------- Inventory (scrollable if >5) + Delete / Delete ALL ----------------
 st.subheader("Saved files")
 
 files = _list_files()
@@ -273,6 +274,39 @@ else:
                     st.success(f"Deleted: {row['name']}")
                 except Exception as e:
                     st.error(f"Could not delete {row['name']}: {e}")
+
+    # --- Delete ALL with guard ---
+    st.markdown("**Danger zone**")
+    d1, d2 = st.columns([1, 3])
+    with d1:
+        if st.button("Delete ALL files", type="secondary"):
+            st.session_state["_delete_all_armed"] = True
+    with d2:
+        if st.session_state["_delete_all_armed"]:
+            st.warning("Type **DELETE ALL** to confirm deletion of every file in the data/ folder.")
+            confirm = st.text_input("Confirmation text")
+            dd1, dd2 = st.columns(2)
+            with dd1:
+                if st.button("Confirm full delete"):
+                    if confirm.strip().upper() == "DELETE ALL":
+                        errs = 0
+                        for fn in list(os.listdir(DATA_DIR)):
+                            fp = os.path.join(DATA_DIR, fn)
+                            if os.path.isfile(fp):
+                                try:
+                                    os.remove(fp)
+                                except Exception:
+                                    errs += 1
+                        st.session_state["_delete_all_armed"] = False
+                        if errs == 0:
+                            st.success("All files deleted.")
+                        else:
+                            st.error("Some files could not be deleted.")
+                    else:
+                        st.error("Confirmation text did not match.")
+            with dd2:
+                if st.button("Cancel"):
+                    st.session_state["_delete_all_armed"] = False
 
 st.divider()
 
