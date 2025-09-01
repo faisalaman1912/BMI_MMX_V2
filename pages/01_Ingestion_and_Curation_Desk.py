@@ -206,53 +206,38 @@ if "_ingested_md5" not in st.session_state:
 
 # ===== 1) Upload files =====
 st.subheader("Upload files (CSV/XLSX)")
-uploads = st.file_uploader("Choose one or more files", type=["csv", "xlsx", "xls"], accept_multiple_files=True)
+uploads = st.file_uploader(
+    "Choose one or more files",
+    type=["csv", "xlsx", "xls"],
+    accept_multiple_files=True,
+    key="uploader_files"
+)
 
-if uploads:
+col_up1, col_up2 = st.columns([1, 1])
+with col_up1:
+    save_uploads = st.button("Save uploaded files", type="primary")
+with col_up2:
+    refresh_files = st.button("Refresh files list")
+
+if save_uploads and uploads:
     saved_count = 0
     for up in uploads:
         try:
-            # Content hash for deduplication (session-level)
-            buf = bytes(up.getbuffer())
-            h = _file_md5_bytes(buf)
-            if h in st.session_state["_ingested_md5"]:
-                # Already saved this exact content in this session -> skip
-                continue
-
             safe_name = _safe_filename(up.name)
             dest = os.path.join(DATASETS_DIR, safe_name)
-
-            # If a file of the same name already exists AND has identical content, skip saving
-            if os.path.exists(dest):
-                try:
-                    if _file_md5_path(dest) == h:
-                        # Same name, same content -> do not create _1, _2, ...
-                        st.session_state["_ingested_md5"].add(h)
-                        continue
-                except Exception:
-                    # If hashing existing file fails, fall back to unique path behavior
-                    pass
-
-            # Choose a unique destination only if needed
             if os.path.exists(dest):
                 dest = _unique_path(DATASETS_DIR, safe_name)
-
-            # Write once
             with open(dest, "wb") as w:
-                w.write(buf)
-
-            st.session_state["_ingested_md5"].add(h)
+                w.write(up.getbuffer())
             saved_count += 1
-
         except Exception as e:
             st.error(f"Failed to save {up.name}: {e}")
-
     if saved_count:
-        st.success(f"Uploaded {saved_count} file(s). Refreshing list…")
-        st.rerun()
+        st.success(f"Uploaded {saved_count} file(s). Use 'Refresh files list' to see them below.")
 
-st.divider()
-
+# Manual refresh of the table (user-triggered)
+if refresh_files:
+    st.rerun()
 # ===== 2) Files list with delete =====
 st.subheader("Available files")
 files = _list_dataset_files()
